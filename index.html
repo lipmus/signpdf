@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF Signer</title>
+  <script src="vendor/pdf.min.js"></script>
+  <script src="vendor/pdf-lib.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, sans-serif; }
+    body { background: #1e1e24; color: #f3f4f6; min-height: 100vh; display: flex; flex-direction: column; }
+    header { background: #2b2b36; padding: 12px 20px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; border-bottom: 1px solid #3f3f50; }
+    .btn { background: #3b82f6; color: #fff; border: 0; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-weight: 500; font-size: 14px; }
+    .btn:hover { background: #2563eb; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-danger { background: #ef4444; }
+    .btn-danger:hover { background: #dc2626; }
+    .btn-success { background: #10b981; }
+    .btn-active { outline: 2px solid #60a5fa; background: #1d4ed8; }
+    .toolbar-group { display: flex; align-items: center; gap: 8px; }
+    label { font-size: 14px; }
+    input[type="color"] { border: 0; width: 32px; height: 32px; border-radius: 4px; cursor: pointer; background: transparent; }
+    input[type="range"] { width: 80px; }
+    #main { flex: 1; display: flex; justify-content: center; align-items: flex-start; padding: 20px; overflow: auto; }
+    #pageContainer { position: relative; box-shadow: 0 4px 20px rgba(0,0,0,0.5); display: none; }
+    #pdfCanvas { display: block; }
+    #signCanvas { position: absolute; top: 0; left: 0; touch-action: none; cursor: crosshair; }
+    #dropzone { border: 2px dashed #4b5563; border-radius: 8px; padding: 60px 40px; text-align: center; margin: auto; cursor: pointer; }
+    #dropzone:hover { border-color: #3b82f6; }
+    #status { font-size: 13px; color: #9ca3af; }
+  </style>
+</head>
+<body>
+  <header>
+    <label class="btn">
+      Upload PDF
+      <input type="file" id="fileInput" accept="application/pdf" style="display:none">
+    </label>
+
+    <div class="toolbar-group">
+      <button id="prevBtn" class="btn" disabled>&lt; Prev</button>
+      <span id="pageInfo">Halaman: 0 / 0</span>
+      <button id="nextBtn" class="btn" disabled>Next &gt;</button>
+    </div>
+
+    <div class="toolbar-group">
+      <button id="penBtn" class="btn btn-active">Pena: Aktif</button>
+      <label>Warna:</label>
+      <input type="color" id="penColor" value="#000000">
+      <label>Tebal:</label>
+      <input type="range" id="penSize" min="1" max="10" value="2">
+      <button id="clearBtn" class="btn btn-danger" disabled>Hapus TTD</button>
+    </div>
+
+    <div class="toolbar-group" style="margin-left: auto;">
+      <span id="status"></span>
+      <button id="downloadBtn" class="btn btn-success" disabled>Download PDF</button>
+    </div>
+  </header>
+
+  <div id="main">
+    <div id="dropzone">
+      <p style="font-size: 18px; margin-bottom: 8px;">Pilih atau tarik file PDF ke sini</p>
+      <p style="color: #9ca3af; font-size: 14px;">Semua proses di browser (offline / aman)</p>
+    </div>
+    <div id="pageContainer">
+      <canvas id="pdfCanvas"></canvas>
+      <canvas id="signCanvas"></canvas>
+    </div>
+  </div>
+
+  <script>
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
+
+    let pdfDoc = null;
+    let pdfBytes = null;
+    let currentPage = 1;
+    let totalPages = 0;
+    let isDrawing = false;
+    let penActive = true;
+    let pageSignatures = {};
+
+    const fileInput = document.getElementById('fileInput');
+    const dropzone = document.getElementById('dropzone');
+    const pageContainer = document.getElementById('pageContainer');
+    const pdfCanvas = document.getElementById('pdfCanvas');
+    const signCanvas = document.getElementById('signCanvas');
+    const pdfCtx = pdfCanvas.getContext('2d');
+    const signCtx = signCanvas.getContext('2d');
+
+    const prevBtn = document.getElementById('prevBtn');
+    const nextBtn = document.getElementById('nextBtn');
+    const pageInfo = document.getElementById('pageInfo');
+    const penBtn = document.getElementById('penBtn');
+    const penColor = document.getElementById('penColor');
+    const penSize = document.getElementById('penSize');
+    const clearBtn = document.getElementById('clearBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const statusText = document.getElementById('status');
+
+    dropzone.addEventListener('click', () => fileInput.click());
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.style.borderColor = '#3b82f6'; });
+    dropzone.addEventListener('dragleave', () => { dropzone.style.borderColor = '#4b5563'; });
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      if (e.dataTransfer.files.length && e.dataTransfer.files[0].type === 'application/pdf') {
+        loadFile(e.dataTransfer.files[0]);
+      }
+    });
+
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files.length) loadFile(e.target.files[0]);
+    });
+
+    async function loadFile(file) {
+      statusText.textContent = 'Memuat PDF...';
+      pdfBytes = await file.arrayBuffer();
+      pageSignatures = {};
+      pdfDoc = await pdfjsLib.getDocument({ data: pdfBytes.slice(0) }).promise;
+      totalPages = pdfDoc.numPages;
+      currentPage = 1;
+
+      dropzone.style.display = 'none';
+      pageContainer.style.display = 'block';
+      downloadBtn.disabled = false;
+      clearBtn.disabled = false;
+      statusText.textContent = '';
+
+      renderPage(currentPage);
+    }
+
+    async function renderPage(num) {
+      saveCurrentSignature();
+      pageInfo.textContent = `Halaman: ${num} / ${totalPages}`;
+      prevBtn.disabled = num <= 1;
+      nextBtn.disabled = num >= totalPages;
+
+      const page = await pdfDoc.getPage(num);
+      const viewport = page.getViewport({ scale: 1.5 });
+
+      pdfCanvas.width = viewport.width;
+      pdfCanvas.height = viewport.height;
+      signCanvas.width = viewport.width;
+      signCanvas.height = viewport.height;
+
+      await page.render({ canvasContext: pdfCtx, viewport }).promise;
+
+      signCtx.clearRect(0, 0, signCanvas.width, signCanvas.height);
+      if (pageSignatures[num]) {
+        const img = new Image();
+        img.onload = () => signCtx.drawImage(img, 0, 0);
+        img.src = pageSignatures[num];
+      }
+    }
+
+    function saveCurrentSignature() {
+      if (!totalPages) return;
+      const blank = document.createElement('canvas');
+      blank.width = signCanvas.width;
+      blank.height = signCanvas.height;
+      if (signCanvas.toDataURL() !== blank.toDataURL()) {
+        pageSignatures[currentPage] = signCanvas.toDataURL('image/png');
+      }
+    }
+
+    prevBtn.addEventListener('click', () => {
+      if (currentPage > 1) { currentPage--; renderPage(currentPage); }
+    });
+    nextBtn.addEventListener('click', () => {
+      if (currentPage < totalPages) { currentPage++; renderPage(currentPage); }
+    });
+
+    penBtn.addEventListener('click', () => {
+      penActive = !penActive;
+      penBtn.classList.toggle('btn-active', penActive);
+      penBtn.textContent = penActive ? 'Pena: Aktif' : 'Pena: Mati';
+      signCanvas.style.pointerEvents = penActive ? 'auto' : 'none';
+    });
+
+    clearBtn.addEventListener('click', () => {
+      signCtx.clearRect(0, 0, signCanvas.width, signCanvas.height);
+      delete pageSignatures[currentPage];
+    });
+
+    function getPos(e) {
+      const rect = signCanvas.getBoundingClientRect();
+      const scaleX = signCanvas.width / rect.width;
+      const scaleY = signCanvas.height / rect.height;
+      const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+      const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+      return { x: (clientX - rect.left) * scaleX, y: (clientY - rect.top) * scaleY };
+    }
+
+    function startDraw(e) {
+      if (!penActive) return;
+      isDrawing = true;
+      const pos = getPos(e);
+      signCtx.beginPath();
+      signCtx.moveTo(pos.x, pos.y);
+      signCtx.strokeStyle = penColor.value;
+      signCtx.lineWidth = penSize.value * 1.5;
+      signCtx.lineCap = 'round';
+      signCtx.lineJoin = 'round';
+    }
+
+    function draw(e) {
+      if (!isDrawing || !penActive) return;
+      e.preventDefault();
+      const pos = getPos(e);
+      signCtx.lineTo(pos.x, pos.y);
+      signCtx.stroke();
+    }
+
+    function stopDraw() {
+      if (!isDrawing) return;
+      isDrawing = false;
+      signCtx.closePath();
+    }
+
+    signCanvas.addEventListener('mousedown', startDraw);
+    signCanvas.addEventListener('mousemove', draw);
+    window.addEventListener('mouseup', stopDraw);
+
+    signCanvas.addEventListener('touchstart', startDraw, { passive: false });
+    signCanvas.addEventListener('touchmove', draw, { passive: false });
+    window.addEventListener('touchend', stopDraw);
+
+    downloadBtn.addEventListener('click', async () => {
+      saveCurrentSignature();
+      statusText.textContent = 'Menyimpan PDF...';
+      downloadBtn.disabled = true;
+
+      try {
+        const { PDFDocument } = PDFLib;
+        const outDoc = await PDFDocument.load(pdfBytes);
+        const pages = outDoc.getPages();
+
+        for (const [pageNumStr, dataUrl] of Object.entries(pageSignatures)) {
+          const pageIndex = parseInt(pageNumStr, 10) - 1;
+          const targetPage = pages[pageIndex];
+          if (!targetPage) continue;
+
+          const pngImage = await outDoc.embedPng(dataUrl);
+          const { width, height } = targetPage.getSize();
+
+          targetPage.drawImage(pngImage, {
+            x: 0,
+            y: 0,
+            width: width,
+            height: height
+          });
+        }
+
+        const signedBytes = await outDoc.save();
+        const blob = new Blob([signedBytes], { type: 'application/pdf' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'dokumen_tervalidasi.pdf';
+        a.click();
+        URL.revokeObjectURL(url);
+        statusText.textContent = 'Selesai!';
+      } catch (err) {
+        console.error(err);
+        statusText.textContent = 'Gagal menyimpan PDF.';
+      } finally {
+        downloadBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
